@@ -94,6 +94,9 @@ type NetworkConfig struct {
 	// SubnetSize specifies the subnet size of the networks created from
 	// the default subnet pool
 	SubnetSize uint32
+
+	// VXLANUDPPort specifies the UDP port number for VXLAN traffic
+	VXLANUDPPort uint32
 }
 
 // New returns a new NetworkAllocator handle
@@ -482,7 +485,7 @@ func (na *cnmNetworkAllocator) IsAttachmentAllocated(node *api.Node, networkAtta
 		return false
 	}
 
-	if networkAttachment == nil {
+	if networkAttachment == nil || networkAttachment.Network == nil {
 		return false
 	}
 

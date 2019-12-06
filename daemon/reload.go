@@ -16,6 +16,7 @@ import (
 // - Daemon debug log level
 // - Daemon max concurrent downloads
 // - Daemon max concurrent uploads
+// - Daemon max download attempts
 // - Daemon shutdown timeout (in seconds)
 // - Cluster discovery (reconfigure and restart)
 // - Daemon labels
@@ -44,6 +45,9 @@ func (daemon *Daemon) Reload(conf *config.Config) (err error) {
 	}
 	daemon.reloadDebug(conf, attributes)
 	daemon.reloadMaxConcurrentDownloadsAndUploads(conf, attributes)
+	if err := daemon.reloadMaxDownloadAttempts(conf, attributes); err != nil {
+		return err
+	}
 	daemon.reloadShutdownTimeout(conf, attributes)
 	daemon.reloadFeatures(conf, attributes)
 
@@ -84,29 +88,51 @@ func (daemon *Daemon) reloadDebug(conf *config.Config, attributes map[string]str
 func (daemon *Daemon) reloadMaxConcurrentDownloadsAndUploads(conf *config.Config, attributes map[string]string) {
 	// If no value is set for max-concurrent-downloads we assume it is the default value
 	// We always "reset" as the cost is lightweight and easy to maintain.
+	maxConcurrentDownloads := config.DefaultMaxConcurrentDownloads
 	if conf.IsValueSet("max-concurrent-downloads") && conf.MaxConcurrentDownloads != nil {
-		*daemon.configStore.MaxConcurrentDownloads = *conf.MaxConcurrentDownloads
-	} else {
-		maxConcurrentDownloads := config.DefaultMaxConcurrentDownloads
-		daemon.configStore.MaxConcurrentDownloads = &maxConcurrentDownloads
+		maxConcurrentDownloads = *conf.MaxConcurrentDownloads
 	}
+	daemon.configStore.MaxConcurrentDownloads = &maxConcurrentDownloads
 	logrus.Debugf("Reset Max Concurrent Downloads: %d", *daemon.configStore.MaxConcurrentDownloads)
 
 	// If no value is set for max-concurrent-upload we assume it is the default value
 	// We always "reset" as the cost is lightweight and easy to maintain.
+	maxConcurrentUploads := config.DefaultMaxConcurrentUploads
 	if conf.IsValueSet("max-concurrent-uploads") && conf.MaxConcurrentUploads != nil {
-		*daemon.configStore.MaxConcurrentUploads = *conf.MaxConcurrentUploads
-	} else {
-		maxConcurrentUploads := config.DefaultMaxConcurrentUploads
-		daemon.configStore.MaxConcurrentUploads = &maxConcurrentUploads
+		maxConcurrentUploads = *conf.MaxConcurrentUploads
 	}
+	daemon.configStore.MaxConcurrentUploads = &maxConcurrentUploads
 	logrus.Debugf("Reset Max Concurrent Uploads: %d", *daemon.configStore.MaxConcurrentUploads)
 
-	daemon.imageService.UpdateConfig(conf.MaxConcurrentDownloads, conf.MaxConcurrentUploads)
+	if daemon.imageService != nil {
+		daemon.imageService.UpdateConfig(&maxConcurrentDownloads, &maxConcurrentUploads)
+	}
+
 	// prepare reload event attributes with updatable configurations
 	attributes["max-concurrent-downloads"] = fmt.Sprintf("%d", *daemon.configStore.MaxConcurrentDownloads)
 	// prepare reload event attributes with updatable configurations
 	attributes["max-concurrent-uploads"] = fmt.Sprintf("%d", *daemon.configStore.MaxConcurrentUploads)
+}
+
+// reloadMaxDownloadAttempts updates configuration with max concurrent
+// download attempts when a connection is lost and updates the passed attributes
+func (daemon *Daemon) reloadMaxDownloadAttempts(conf *config.Config, attributes map[string]string) error {
+	if err := config.ValidateMaxDownloadAttempts(conf); err != nil {
+		return err
+	}
+
+	// If no value is set for max-download-attempts we assume it is the default value
+	// We always "reset" as the cost is lightweight and easy to maintain.
+	maxDownloadAttempts := config.DefaultDownloadAttempts
+	if conf.IsValueSet("max-download-attempts") && conf.MaxDownloadAttempts != nil {
+		maxDownloadAttempts = *conf.MaxDownloadAttempts
+	}
+	daemon.configStore.MaxDownloadAttempts = &maxDownloadAttempts
+	logrus.Debugf("Reset Max Download Attempts: %d", *daemon.configStore.MaxDownloadAttempts)
+
+	// prepare reload event attributes with updatable configurations
+	attributes["max-download-attempts"] = fmt.Sprintf("%d", *daemon.configStore.MaxDownloadAttempts)
+	return nil
 }
 
 // reloadShutdownTimeout updates configuration with daemon shutdown timeout option

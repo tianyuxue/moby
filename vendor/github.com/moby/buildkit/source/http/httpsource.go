@@ -15,9 +15,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/locker"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/metadata"
+	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/source"
 	"github.com/moby/buildkit/util/tracing"
@@ -33,10 +35,10 @@ type Opt struct {
 }
 
 type httpSource struct {
-	md     *metadata.Store
-	cache  cache.Accessor
-	locker *locker.Locker
-	client *http.Client
+	md        *metadata.Store
+	cache     cache.Accessor
+	locker    *locker.Locker
+	transport http.RoundTripper
 }
 
 func NewSource(opt Opt) (source.Source, error) {
@@ -45,12 +47,10 @@ func NewSource(opt Opt) (source.Source, error) {
 		transport = tracing.DefaultTransport
 	}
 	hs := &httpSource{
-		md:     opt.MetadataStore,
-		cache:  opt.CacheAccessor,
-		locker: locker.New(),
-		client: &http.Client{
-			Transport: transport,
-		},
+		md:        opt.MetadataStore,
+		cache:     opt.CacheAccessor,
+		locker:    locker.New(),
+		transport: transport,
 	}
 	return hs, nil
 }
@@ -64,17 +64,21 @@ type httpSourceHandler struct {
 	src      source.HttpIdentifier
 	refID    string
 	cacheKey digest.Digest
+	client   *http.Client
 }
 
-func (hs *httpSource) Resolve(ctx context.Context, id source.Identifier) (source.SourceInstance, error) {
+func (hs *httpSource) Resolve(ctx context.Context, id source.Identifier, sm *session.Manager) (source.SourceInstance, error) {
 	httpIdentifier, ok := id.(*source.HttpIdentifier)
 	if !ok {
 		return nil, errors.Errorf("invalid http identifier %v", id)
 	}
 
+	sessionID := session.FromContext(ctx)
+
 	return &httpSourceHandler{
 		src:        *httpIdentifier,
 		httpSource: hs,
+		client:     &http.Client{Transport: newTransport(hs.transport, sm, sessionID)},
 	}, nil
 }
 
@@ -140,17 +144,63 @@ func (hs *httpSourceHandler) CacheKey(ctx context.Context, index int) (string, b
 	req = req.WithContext(ctx)
 	m := map[string]*metadata.StorageItem{}
 
+	// If we request a single ETag in 'If-None-Match', some servers omit the
+	// unambiguous ETag in their response.
+	// See: https://github.com/moby/buildkit/issues/905
+	var onlyETag string
+
 	if len(sis) > 0 {
 		for _, si := range sis {
 			// if metaDigest := getMetaDigest(si); metaDigest == hs.formatCacheKey("") {
 			if etag := getETag(si); etag != "" {
 				if dgst := getChecksum(si); dgst != "" {
 					m[etag] = si
-					req.Header.Add("If-None-Match", etag)
 				}
 			}
 			// }
 		}
+		if len(m) > 0 {
+			etags := make([]string, 0, len(m))
+			for t := range m {
+				etags = append(etags, t)
+			}
+			req.Header.Add("If-None-Match", strings.Join(etags, ", "))
+
+			if len(etags) == 1 {
+				onlyETag = etags[0]
+			}
+		}
+	}
+
+	// Some servers seem to have trouble supporting If-None-Match properly even
+	// though they return ETag-s. So first, optionally try a HEAD request with
+	// manual ETag value comparison.
+	if len(m) > 0 {
+		req.Method = "HEAD"
+		resp, err := hs.client.Do(req)
+		if err == nil {
+			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotModified {
+				respETag := resp.Header.Get("ETag")
+
+				// If a 304 is returned without an ETag and we had only sent one ETag,
+				// the response refers to the ETag we asked about.
+				if respETag == "" && onlyETag != "" && resp.StatusCode == http.StatusNotModified {
+					respETag = onlyETag
+				}
+				si, ok := m[respETag]
+				if ok {
+					hs.refID = si.ID()
+					dgst := getChecksum(si)
+					if dgst != "" {
+						modTime := getModTime(si)
+						resp.Body.Close()
+						return hs.formatCacheKey(getFileName(hs.src.URL, hs.src.Filename, resp), dgst, modTime).String(), true, nil
+					}
+				}
+			}
+			resp.Body.Close()
+		}
+		req.Method = "GET"
 	}
 
 	resp, err := hs.client.Do(req)
@@ -162,6 +212,13 @@ func (hs *httpSourceHandler) CacheKey(ctx context.Context, index int) (string, b
 	}
 	if resp.StatusCode == http.StatusNotModified {
 		respETag := resp.Header.Get("ETag")
+		if respETag == "" && onlyETag != "" {
+			respETag = onlyETag
+
+			// Set the missing ETag header on the response so that it's available
+			// to .save()
+			resp.Header.Set("ETag", onlyETag)
+		}
 		si, ok := m[respETag]
 		if !ok {
 			return "", false, errors.Errorf("invalid not-modified ETag: %v", respETag)
@@ -246,8 +303,22 @@ func (hs *httpSourceHandler) save(ctx context.Context, resp *http.Response) (ref
 	}
 	f = nil
 
-	if hs.src.UID != 0 || hs.src.GID != 0 {
-		if err := os.Chown(fp, hs.src.UID, hs.src.GID); err != nil {
+	uid := hs.src.UID
+	gid := hs.src.GID
+	if idmap := mount.IdentityMapping(); idmap != nil {
+		identity, err := idmap.ToHost(idtools.Identity{
+			UID: int(uid),
+			GID: int(gid),
+		})
+		if err != nil {
+			return nil, "", err
+		}
+		uid = identity.UID
+		gid = identity.GID
+	}
+
+	if gid != 0 || uid != 0 {
+		if err := os.Chown(fp, uid, gid); err != nil {
 			return nil, "", err
 		}
 	}

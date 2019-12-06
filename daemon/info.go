@@ -20,12 +20,14 @@ import (
 	"github.com/docker/docker/pkg/sysinfo"
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/registry"
-	"github.com/docker/go-connections/sockets"
+	metrics "github.com/docker/go-metrics"
 	"github.com/sirupsen/logrus"
 )
 
 // SystemInfo returns information about the host server the daemon is running on.
 func (daemon *Daemon) SystemInfo() (*types.Info, error) {
+	defer metrics.StartTimer(hostInfoFunctions.WithValues("system_info"))()
+
 	sysInfo := sysinfo.New(true)
 	cRunning, cPaused, cStopped := stateCtr.get()
 
@@ -49,6 +51,7 @@ func (daemon *Daemon) SystemInfo() (*types.Info, error) {
 		NEventsListener:    daemon.EventsService.SubscribersCount(),
 		KernelVersion:      kernelVersion(),
 		OperatingSystem:    operatingSystem(),
+		OSVersion:          osVersion(),
 		IndexServerAddress: registry.IndexServer,
 		OSType:             platform.OSType,
 		Architecture:       platform.Architecture,
@@ -62,9 +65,9 @@ func (daemon *Daemon) SystemInfo() (*types.Info, error) {
 		ServerVersion:      dockerversion.Version,
 		ClusterStore:       daemon.configStore.ClusterStore,
 		ClusterAdvertise:   daemon.configStore.ClusterAdvertise,
-		HTTPProxy:          maskCredentials(sockets.GetProxyEnv("http_proxy")),
-		HTTPSProxy:         maskCredentials(sockets.GetProxyEnv("https_proxy")),
-		NoProxy:            sockets.GetProxyEnv("no_proxy"),
+		HTTPProxy:          maskCredentials(getEnvAny("HTTP_PROXY", "http_proxy")),
+		HTTPSProxy:         maskCredentials(getEnvAny("HTTPS_PROXY", "https_proxy")),
+		NoProxy:            getEnvAny("NO_PROXY", "no_proxy"),
 		LiveRestoreEnabled: daemon.configStore.LiveRestoreEnabled,
 		Isolation:          daemon.defaultIsolation,
 	}
@@ -82,6 +85,8 @@ func (daemon *Daemon) SystemInfo() (*types.Info, error) {
 
 // SystemVersion returns version information about the daemon.
 func (daemon *Daemon) SystemVersion() types.Version {
+	defer metrics.StartTimer(hostInfoFunctions.WithValues("system_version"))()
+
 	kernelVersion := kernelVersion()
 
 	v := types.Version{
@@ -118,6 +123,7 @@ func (daemon *Daemon) SystemVersion() types.Version {
 
 	v.Platform.Name = dockerversion.PlatformName
 
+	daemon.fillPlatformVersion(&v)
 	return v
 }
 
@@ -174,6 +180,13 @@ func (daemon *Daemon) fillSecurityOptions(v *types.Info, sysInfo *sysinfo.SysInf
 	if rootIDs := daemon.idMapping.RootPair(); rootIDs.UID != 0 || rootIDs.GID != 0 {
 		securityOptions = append(securityOptions, "name=userns")
 	}
+	if daemon.Rootless() {
+		securityOptions = append(securityOptions, "name=rootless")
+	}
+	if daemon.cgroupNamespacesEnabled(sysInfo) {
+		securityOptions = append(securityOptions, "name=cgroupns")
+	}
+
 	v.SecurityOptions = securityOptions
 }
 
@@ -232,8 +245,9 @@ func memInfo() *system.MemInfo {
 	return memInfo
 }
 
-func operatingSystem() string {
-	var operatingSystem string
+func operatingSystem() (operatingSystem string) {
+	defer metrics.StartTimer(hostInfoFunctions.WithValues("operating_system"))()
+
 	if s, err := operatingsystem.GetOperatingSystem(); err != nil {
 		logrus.Warnf("Could not get operating system name: %v", err)
 	} else {
@@ -248,7 +262,19 @@ func operatingSystem() string {
 			operatingSystem += " (containerized)"
 		}
 	}
+
 	return operatingSystem
+}
+
+func osVersion() (version string) {
+	defer metrics.StartTimer(hostInfoFunctions.WithValues("os_version"))()
+
+	version, err := operatingsystem.GetOperatingSystemVersion()
+	if err != nil {
+		logrus.Warnf("Could not get operating system version: %v", err)
+	}
+
+	return version
 }
 
 func maskCredentials(rawURL string) string {
@@ -259,4 +285,13 @@ func maskCredentials(rawURL string) string {
 	parsedURL.User = url.UserPassword("xxxxx", "xxxxx")
 	maskedURL := parsedURL.String()
 	return maskedURL
+}
+
+func getEnvAny(names ...string) string {
+	for _, n := range names {
+		if val := os.Getenv(n); val != "" {
+			return val
+		}
+	}
+	return ""
 }

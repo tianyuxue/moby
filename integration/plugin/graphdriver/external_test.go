@@ -19,9 +19,9 @@ import (
 	"github.com/docker/docker/daemon/graphdriver/vfs"
 	"github.com/docker/docker/integration/internal/container"
 	"github.com/docker/docker/integration/internal/requirement"
-	"github.com/docker/docker/internal/test/daemon"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/plugins"
+	"github.com/docker/docker/testutil/daemon"
 	"gotest.tools/assert"
 	is "gotest.tools/assert/cmp"
 	"gotest.tools/skip"
@@ -54,7 +54,7 @@ func TestExternalGraphDriver(t *testing.T) {
 	sserver := setupPluginViaSpecFile(t, ec)
 	jserver := setupPluginViaJSONFile(t, ec)
 	// Create daemon
-	d := daemon.New(t, daemon.WithExperimental)
+	d := daemon.New(t, daemon.WithExperimental())
 	c := d.NewClientT(t)
 
 	for _, tc := range []struct {
@@ -360,7 +360,7 @@ func testExternalGraphDriver(ext string, ec map[string]*graphEventsCounter) func
 
 			ctx := context.Background()
 
-			testGraphDriver(t, c, ctx, driverName, func(t *testing.T) {
+			testGraphDriver(ctx, t, c, driverName, func(t *testing.T) {
 				d.Restart(t, "-s", driverName)
 			})
 
@@ -399,7 +399,7 @@ func testGraphDriverPull(c client.APIClient, d *daemon.Daemon) func(*testing.T) 
 		_, err = io.Copy(ioutil.Discard, r)
 		assert.NilError(t, err)
 
-		container.Run(t, ctx, c, container.WithImage("busybox:latest@sha256:bbc3a03235220b170ba48a157dd097dd1379299370e1ed99ce976df0355d24f0"))
+		container.Run(ctx, t, c, container.WithImage("busybox:latest@sha256:bbc3a03235220b170ba48a157dd097dd1379299370e1ed99ce976df0355d24f0"))
 	}
 }
 
@@ -410,7 +410,7 @@ func TestGraphdriverPluginV2(t *testing.T) {
 	skip.If(t, os.Getenv("DOCKER_ENGINE_GOARCH") != "amd64")
 	skip.If(t, !requirement.Overlay2Supported(testEnv.DaemonInfo.KernelVersion))
 
-	d := daemon.New(t, daemon.WithExperimental)
+	d := daemon.New(t, daemon.WithExperimental())
 	d.Start(t)
 	defer d.Stop(t)
 
@@ -424,8 +424,8 @@ func TestGraphdriverPluginV2(t *testing.T) {
 		RemoteRef:            plugin,
 		AcceptAllPermissions: true,
 	})
-	defer responseReader.Close()
 	assert.NilError(t, err)
+	defer responseReader.Close()
 	// ensure it's done by waiting for EOF on the response
 	_, err = io.Copy(ioutil.Discard, responseReader)
 	assert.NilError(t, err)
@@ -434,12 +434,11 @@ func TestGraphdriverPluginV2(t *testing.T) {
 	d.Stop(t)
 	d.StartWithBusybox(t, "-s", plugin, "--storage-opt", "overlay2.override_kernel_check=1")
 
-	testGraphDriver(t, client, ctx, plugin, nil)
+	testGraphDriver(ctx, t, client, plugin, nil)
 }
 
-// nolint: golint
-func testGraphDriver(t *testing.T, c client.APIClient, ctx context.Context, driverName string, afterContainerRunFn func(*testing.T)) { //nolint: golint
-	id := container.Run(t, ctx, c, container.WithCmd("sh", "-c", "echo hello > /hello"))
+func testGraphDriver(ctx context.Context, t *testing.T, c client.APIClient, driverName string, afterContainerRunFn func(*testing.T)) {
+	id := container.Run(ctx, t, c, container.WithCmd("sh", "-c", "echo hello > /hello"))
 
 	if afterContainerRunFn != nil {
 		afterContainerRunFn(t)

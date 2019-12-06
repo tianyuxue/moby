@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"io/ioutil"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,7 +20,8 @@ import (
 	"github.com/docker/swarmkit/identity"
 
 	"github.com/docker/docker/pkg/plugingetter"
-	metrics "github.com/docker/go-metrics"
+	"github.com/docker/go-metrics"
+	"github.com/docker/libnetwork/drivers/overlay/overlayutils"
 	"github.com/docker/swarmkit/agent"
 	"github.com/docker/swarmkit/agent/exec"
 	"github.com/docker/swarmkit/api"
@@ -161,6 +163,7 @@ type Node struct {
 	manager          *manager.Manager
 	notifyNodeChange chan *agent.NodeChanges // used by the agent to relay node updates from the dispatcher Session stream to (*Node).run
 	unlockKey        []byte
+	vxlanUDPPort     uint32
 }
 
 type lastSeenRole struct {
@@ -269,6 +272,15 @@ func (n *Node) currentRole() api.NodeRole {
 	return currentRole
 }
 
+// configVXLANUDPPort sets vxlan port in libnetwork
+func configVXLANUDPPort(ctx context.Context, vxlanUDPPort uint32) {
+	if err := overlayutils.ConfigVXLANUDPPort(vxlanUDPPort); err != nil {
+		log.G(ctx).WithError(err).Error("failed to configure VXLAN UDP port")
+		return
+	}
+	logrus.Infof("initialized VXLAN UDP port to %d ", vxlanUDPPort)
+}
+
 func (n *Node) run(ctx context.Context) (err error) {
 	defer func() {
 		n.err = err
@@ -358,6 +370,10 @@ func (n *Node) run(ctx context.Context) (err error) {
 				return
 			case nodeChanges := <-n.notifyNodeChange:
 				if nodeChanges.Node != nil {
+					if nodeChanges.Node.VXLANUDPPort != 0 {
+						n.vxlanUDPPort = nodeChanges.Node.VXLANUDPPort
+						configVXLANUDPPort(ctx, n.vxlanUDPPort)
+					}
 					// This is a bit complex to be backward compatible with older CAs that
 					// don't support the Node.Role field. They only use what's presently
 					// called DesiredRole.
@@ -896,6 +912,7 @@ func (n *Node) initManagerConnection(ctx context.Context, ready chan<- struct{})
 	opts := []grpc.DialOption{
 		grpc.WithUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor),
 		grpc.WithStreamInterceptor(grpc_prometheus.StreamClientInterceptor),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(math.MaxInt32)),
 	}
 	insecureCreds := credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})
 	opts = append(opts, grpc.WithTransportCredentials(insecureCreds))

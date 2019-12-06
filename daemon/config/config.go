@@ -3,13 +3,11 @@ package config // import "github.com/docker/docker/daemon/config"
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 
@@ -19,6 +17,7 @@ import (
 	"github.com/docker/docker/pkg/discovery"
 	"github.com/docker/docker/registry"
 	"github.com/imdario/mergo"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 )
@@ -32,6 +31,10 @@ const (
 	// maximum number of uploads that
 	// may take place at a time for each push.
 	DefaultMaxConcurrentUploads = 5
+	// DefaultDownloadAttempts is the default value for
+	// maximum number of attempts that
+	// may take place at a time for each pull when the connection is lost.
+	DefaultDownloadAttempts = 5
 	// StockRuntimeName is the reserved name/alias used to represent the
 	// OCI runtime being shipped with the docker daemon package.
 	StockRuntimeName = "runc"
@@ -64,6 +67,8 @@ var flatOptions = map[string]bool{
 var skipValidateOptions = map[string]bool{
 	"features": true,
 	"builder":  true,
+	// Corresponding flag has been removed because it was already unusable
+	"deprecated-key-path": true,
 }
 
 // skipDuplicates contains configuration keys that
@@ -108,6 +113,13 @@ type CommonTLSOptions struct {
 	KeyFile  string `json:"tlskey,omitempty"`
 }
 
+// DNSConfig defines the DNS configurations.
+type DNSConfig struct {
+	DNS        []string `json:"dns,omitempty"`
+	DNSOptions []string `json:"dns-opts,omitempty"`
+	DNSSearch  []string `json:"dns-search,omitempty"`
+}
+
 // CommonConfig defines the configuration of a docker daemon which is
 // common across platforms.
 // It includes json tags to deserialize configuration from a file
@@ -118,9 +130,6 @@ type CommonConfig struct {
 	AutoRestart           bool                      `json:"-"`
 	Context               map[string][]string       `json:"-"`
 	DisableBridge         bool                      `json:"-"`
-	DNS                   []string                  `json:"dns,omitempty"`
-	DNSOptions            []string                  `json:"dns-opts,omitempty"`
-	DNSSearch             []string                  `json:"dns-search,omitempty"`
 	ExecOptions           []string                  `json:"exec-opts,omitempty"`
 	GraphDriver           string                    `json:"storage-driver,omitempty"`
 	GraphOptions          []string                  `json:"storage-opts,omitempty"`
@@ -167,6 +176,10 @@ type CommonConfig struct {
 	// may take place at a time for each push.
 	MaxConcurrentUploads *int `json:"max-concurrent-uploads,omitempty"`
 
+	// MaxDownloadAttempts is the maximum number of attempts that
+	// may take place at a time for each push.
+	MaxDownloadAttempts *int `json:"max-download-attempts,omitempty"`
+
 	// ShutdownTimeout is the timeout value (in seconds) the daemon will wait for the container
 	// to stop when daemon is being shutdown
 	ShutdownTimeout int `json:"shutdown-timeout,omitempty"`
@@ -199,6 +212,7 @@ type CommonConfig struct {
 
 	MetricsAddress string `json:"metrics-addr"`
 
+	DNSConfig
 	LogConfig
 	BridgeConfig // bridgeConfig holds bridge network specific configuration.
 	NetworkConfig
@@ -229,6 +243,9 @@ type CommonConfig struct {
 	Features map[string]bool `json:"features,omitempty"`
 
 	Builder BuilderConfig `json:"builder,omitempty"`
+
+	ContainerdNamespace       string `json:"containerd-namespace,omitempty"`
+	ContainerdPluginNamespace string `json:"containerd-plugin-namespace,omitempty"`
 }
 
 // IsValueSet returns true if a configuration value
@@ -246,10 +263,6 @@ func New() *Config {
 	config := Config{}
 	config.LogConfig.Config = make(map[string]string)
 	config.ClusterOpts = make(map[string]string)
-
-	if runtime.GOOS != "linux" {
-		config.V2Only = true
-	}
 	return &config
 }
 
@@ -264,7 +277,7 @@ func ParseClusterAdvertiseSettings(clusterStore, clusterAdvertise string) (strin
 
 	advertise, err := discovery.ParseAdvertise(clusterAdvertise)
 	if err != nil {
-		return "", fmt.Errorf("discovery advertise parsing failed (%v)", err)
+		return "", errors.Wrap(err, "discovery advertise parsing failed")
 	}
 	return advertise, nil
 }
@@ -318,13 +331,13 @@ func Reload(configFile string, flags *pflag.FlagSet, reload func(*Config)) error
 	newConfig, err := getConflictFreeConfiguration(configFile, flags)
 	if err != nil {
 		if flags.Changed("config-file") || !os.IsNotExist(err) {
-			return fmt.Errorf("unable to configure the Docker daemon with file %s: %v", configFile, err)
+			return errors.Wrapf(err, "unable to configure the Docker daemon with file %s", configFile)
 		}
 		newConfig = New()
 	}
 
 	if err := Validate(newConfig); err != nil {
-		return fmt.Errorf("file configuration validation failed (%v)", err)
+		return errors.Wrap(err, "file configuration validation failed")
 	}
 
 	// Check if duplicate label-keys with different values are found
@@ -355,7 +368,7 @@ func MergeDaemonConfigurations(flagsConfig *Config, flags *pflag.FlagSet, config
 	}
 
 	if err := Validate(fileConfig); err != nil {
-		return nil, fmt.Errorf("configuration validation from file failed (%v)", err)
+		return nil, errors.Wrap(err, "configuration validation from file failed")
 	}
 
 	// merge flags configuration on top of the file configuration
@@ -366,7 +379,7 @@ func MergeDaemonConfigurations(flagsConfig *Config, flags *pflag.FlagSet, config
 	// We need to validate again once both fileConfig and flagsConfig
 	// have been merged
 	if err := Validate(fileConfig); err != nil {
-		return nil, fmt.Errorf("merged configuration validation from file and command line flags failed (%v)", err)
+		return nil, errors.Wrap(err, "merged configuration validation from file and command line flags failed")
 	}
 
 	return fileConfig, nil
@@ -438,7 +451,7 @@ func getConflictFreeConfiguration(configFile string, flags *pflag.FlagSet) (*Con
 		logrus.Warn(`The "graph" config file option is deprecated. Please use "data-root" instead.`)
 
 		if config.Root != "" {
-			return nil, fmt.Errorf(`cannot specify both "graph" and "data-root" config file options`)
+			return nil, errors.New(`cannot specify both "graph" and "data-root" config file options`)
 		}
 
 		config.Root = config.RootDeprecated
@@ -480,9 +493,7 @@ func findConfigurationConflicts(config map[string]interface{}, flags *pflag.Flag
 	if len(unknownKeys) > 0 {
 		unknownNamedConflicts := func(f *pflag.Flag) {
 			if namedOption, ok := f.Value.(opts.NamedOption); ok {
-				if _, valid := unknownKeys[namedOption.Name()]; valid {
-					delete(unknownKeys, namedOption.Name())
-				}
+				delete(unknownKeys, namedOption.Name())
 			}
 		}
 		flags.VisitAll(unknownNamedConflicts)
@@ -529,7 +540,7 @@ func findConfigurationConflicts(config map[string]interface{}, flags *pflag.Flag
 
 // Validate validates some specific configs.
 // such as config.DNS, config.Labels, config.DNSSearch,
-// as well as config.MaxConcurrentDownloads, config.MaxConcurrentUploads.
+// as well as config.MaxConcurrentDownloads, config.MaxConcurrentUploads and config.MaxDownloadAttempts.
 func Validate(config *Config) error {
 	// validate DNS
 	for _, dns := range config.DNS {
@@ -559,6 +570,9 @@ func Validate(config *Config) error {
 	if config.MaxConcurrentUploads != nil && *config.MaxConcurrentUploads < 0 {
 		return fmt.Errorf("invalid max concurrent uploads: %d", *config.MaxConcurrentUploads)
 	}
+	if err := ValidateMaxDownloadAttempts(config); err != nil {
+		return err
+	}
 
 	// validate that "default" runtime is not reset
 	if runtimes := config.GetAllRuntimes(); len(runtimes) > 0 {
@@ -580,6 +594,14 @@ func Validate(config *Config) error {
 
 	// validate platform-specific settings
 	return config.ValidatePlatformConfig()
+}
+
+// ValidateMaxDownloadAttempts validates if the max-download-attempts is within the valid range
+func ValidateMaxDownloadAttempts(config *Config) error {
+	if config.MaxDownloadAttempts != nil && *config.MaxDownloadAttempts <= 0 {
+		return fmt.Errorf("invalid max download attempts: %d", *config.MaxDownloadAttempts)
+	}
+	return nil
 }
 
 // ModifiedDiscoverySettings returns whether the discovery configuration has been modified or not.

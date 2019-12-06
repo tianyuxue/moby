@@ -7,10 +7,12 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/docker/docker/layer"
+	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/snapshot"
 	digest "github.com/opencontainers/go-digest"
@@ -20,14 +22,16 @@ import (
 
 var keyParent = []byte("parent")
 var keyCommitted = []byte("committed")
+var keyIsCommitted = []byte("iscommitted")
 var keyChainID = []byte("chainid")
 var keySize = []byte("size")
 
 // Opt defines options for creating the snapshotter
 type Opt struct {
-	GraphDriver graphdriver.Driver
-	LayerStore  layer.Store
-	Root        string
+	GraphDriver     graphdriver.Driver
+	LayerStore      layer.Store
+	Root            string
+	IdentityMapping *idtools.IdentityMapping
 }
 
 type graphIDRegistrar interface {
@@ -49,19 +53,17 @@ type snapshotter struct {
 	reg  graphIDRegistrar
 }
 
-var _ snapshot.SnapshotterBase = &snapshotter{}
-
 // NewSnapshotter creates a new snapshotter
-func NewSnapshotter(opt Opt) (snapshot.SnapshotterBase, error) {
+func NewSnapshotter(opt Opt, prevLM leases.Manager) (snapshot.Snapshotter, leases.Manager, error) {
 	dbPath := filepath.Join(opt.Root, "snapshots.db")
 	db, err := bolt.Open(dbPath, 0600, nil)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to open database file %s", dbPath)
+		return nil, nil, errors.Wrapf(err, "failed to open database file %s", dbPath)
 	}
 
 	reg, ok := opt.LayerStore.(graphIDRegistrar)
 	if !ok {
-		return nil, errors.Errorf("layerstore doesn't support graphID registration")
+		return nil, nil, errors.Errorf("layerstore doesn't support graphID registration")
 	}
 
 	s := &snapshotter{
@@ -70,18 +72,45 @@ func NewSnapshotter(opt Opt) (snapshot.SnapshotterBase, error) {
 		refs: map[string]layer.Layer{},
 		reg:  reg,
 	}
-	return s, nil
+
+	lm := newLeaseManager(s, prevLM)
+
+	ll, err := lm.List(context.TODO())
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, l := range ll {
+		rr, err := lm.ListResources(context.TODO(), l)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, r := range rr {
+			if r.Type == "snapshots/default" {
+				lm.addRef(l.ID, r.ID)
+			}
+		}
+	}
+
+	return s, lm, nil
+}
+
+func (s *snapshotter) Name() string {
+	return "default"
+}
+
+func (s *snapshotter) IdentityMapping() *idtools.IdentityMapping {
+	return s.opt.IdentityMapping
 }
 
 func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) error {
 	origParent := parent
 	if parent != "" {
 		if l, err := s.getLayer(parent, false); err != nil {
-			return err
+			return errors.Wrapf(err, "failed to get parent layer %s", parent)
 		} else if l != nil {
 			parent, err = getGraphID(l)
 			if err != nil {
-				return err
+				return errors.Wrapf(err, "failed to get parent graphid %s", l.ChainID())
 			}
 		} else {
 			parent, _ = s.getGraphDriverID(parent)
@@ -136,7 +165,7 @@ func (s *snapshotter) getLayer(key string, withCommitted bool) (layer.Layer, err
 				return nil
 			}); err != nil {
 				s.mu.Unlock()
-				return nil, err
+				return nil, errors.WithStack(err)
 			}
 			if id == "" {
 				s.mu.Unlock()
@@ -147,12 +176,12 @@ func (s *snapshotter) getLayer(key string, withCommitted bool) (layer.Layer, err
 		l, err = s.opt.LayerStore.Get(id)
 		if err != nil {
 			s.mu.Unlock()
-			return nil, err
+			return nil, errors.WithStack(err)
 		}
 		s.refs[key] = l
 		if err := s.db.Update(func(tx *bolt.Tx) error {
 			_, err := tx.CreateBucketIfNotExists([]byte(key))
-			return err
+			return errors.WithStack(err)
 		}); err != nil {
 			s.mu.Unlock()
 			return nil, err
@@ -244,24 +273,24 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (snapshot.Mountabl
 		id := identity.NewID()
 		var rwlayer layer.RWLayer
 		return &mountable{
-			acquire: func() ([]mount.Mount, error) {
+			idmap: s.opt.IdentityMapping,
+			acquire: func() ([]mount.Mount, func() error, error) {
 				rwlayer, err = s.opt.LayerStore.CreateRWLayer(id, l.ChainID(), nil)
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 				rootfs, err := rwlayer.Mount("")
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 				return []mount.Mount{{
-					Source:  rootfs.Path(),
-					Type:    "bind",
-					Options: []string{"rbind"},
-				}}, nil
-			},
-			release: func() error {
-				_, err := s.opt.LayerStore.ReleaseRWLayer(rwlayer)
-				return err
+						Source:  rootfs.Path(),
+						Type:    "bind",
+						Options: []string{"rbind"},
+					}}, func() error {
+						_, err := s.opt.LayerStore.ReleaseRWLayer(rwlayer)
+						return err
+					}, nil
 			},
 		}, nil
 	}
@@ -269,24 +298,28 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (snapshot.Mountabl
 	id, _ := s.getGraphDriverID(key)
 
 	return &mountable{
-		acquire: func() ([]mount.Mount, error) {
+		idmap: s.opt.IdentityMapping,
+		acquire: func() ([]mount.Mount, func() error, error) {
 			rootfs, err := s.opt.GraphDriver.Get(id, "")
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			return []mount.Mount{{
-				Source:  rootfs.Path(),
-				Type:    "bind",
-				Options: []string{"rbind"},
-			}}, nil
-		},
-		release: func() error {
-			return s.opt.GraphDriver.Put(id)
+					Source:  rootfs.Path(),
+					Type:    "bind",
+					Options: []string{"rbind"},
+				}}, func() error {
+					return s.opt.GraphDriver.Put(id)
+				}, nil
 		},
 	}, nil
 }
 
 func (s *snapshotter) Remove(ctx context.Context, key string) error {
+	return errors.Errorf("calling snapshot.remove is forbidden")
+}
+
+func (s *snapshotter) remove(ctx context.Context, key string) error {
 	l, err := s.getLayer(key, true)
 	if err != nil {
 		return err
@@ -295,8 +328,17 @@ func (s *snapshotter) Remove(ctx context.Context, key string) error {
 	id, _ := s.getGraphDriverID(key)
 
 	var found bool
+	var alreadyCommitted bool
 	if err := s.db.Update(func(tx *bolt.Tx) error {
-		found = tx.Bucket([]byte(key)) != nil
+		b := tx.Bucket([]byte(key))
+		found = b != nil
+
+		if b != nil {
+			if b.Get(keyIsCommitted) != nil {
+				alreadyCommitted = true
+				return nil
+			}
+		}
 		if found {
 			tx.DeleteBucket([]byte(key))
 			if id != key {
@@ -306,6 +348,10 @@ func (s *snapshotter) Remove(ctx context.Context, key string) error {
 		return nil
 	}); err != nil {
 		return err
+	}
+
+	if alreadyCommitted {
+		return nil
 	}
 
 	if l != nil {
@@ -329,7 +375,17 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		if err != nil {
 			return err
 		}
-		return b.Put(keyCommitted, []byte(key))
+		if err := b.Put(keyCommitted, []byte(key)); err != nil {
+			return err
+		}
+		b, err = tx.CreateBucketIfNotExists([]byte(key))
+		if err != nil {
+			return err
+		}
+		if err := b.Put(keyIsCommitted, []byte{}); err != nil {
+			return err
+		}
+		return nil
 	})
 }
 
@@ -428,31 +484,33 @@ func (s *snapshotter) Close() error {
 type mountable struct {
 	mu       sync.Mutex
 	mounts   []mount.Mount
-	acquire  func() ([]mount.Mount, error)
+	acquire  func() ([]mount.Mount, func() error, error)
 	release  func() error
 	refCount int
+	idmap    *idtools.IdentityMapping
 }
 
-func (m *mountable) Mount() ([]mount.Mount, error) {
+func (m *mountable) Mount() ([]mount.Mount, func() error, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.mounts != nil {
 		m.refCount++
-		return m.mounts, nil
+		return m.mounts, m.releaseMount, nil
 	}
 
-	mounts, err := m.acquire()
+	mounts, release, err := m.acquire()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	m.mounts = mounts
+	m.release = release
 	m.refCount = 1
 
-	return m.mounts, nil
+	return m.mounts, m.releaseMount, nil
 }
 
-func (m *mountable) Release() error {
+func (m *mountable) releaseMount() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -467,5 +525,12 @@ func (m *mountable) Release() error {
 	}
 
 	m.mounts = nil
+	defer func() {
+		m.release = nil
+	}()
 	return m.release()
+}
+
+func (m *mountable) IdentityMapping() *idtools.IdentityMapping {
+	return m.idmap
 }

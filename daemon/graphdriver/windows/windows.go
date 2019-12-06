@@ -19,11 +19,12 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/Microsoft/go-winio"
+	winio "github.com/Microsoft/go-winio"
 	"github.com/Microsoft/go-winio/archive/tar"
 	"github.com/Microsoft/go-winio/backuptar"
 	"github.com/Microsoft/go-winio/vhd"
 	"github.com/Microsoft/hcsshim"
+	"github.com/Microsoft/hcsshim/osversion"
 	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/containerfs"
@@ -31,7 +32,6 @@ import (
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/longpath"
 	"github.com/docker/docker/pkg/reexec"
-	"github.com/docker/docker/pkg/system"
 	units "github.com/docker/go-units"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -272,7 +272,6 @@ func (d *Driver) Remove(id string) error {
 	// it is a transient error. Retry until it succeeds.
 	var computeSystems []hcsshim.ContainerProperties
 	retryCount := 0
-	osv := system.GetOSVersion()
 	for {
 		// Get and terminate any template VMs that are currently using the layer.
 		// Note: It is unfortunate that we end up in the graphdrivers Remove() call
@@ -286,7 +285,7 @@ func (d *Driver) Remove(id string) error {
 		// in RS1 and RS2 building during enumeration when a silo is going away
 		// for example under it, in HCS. AccessIsDenied added to fix 30278.
 		//
-		// TODO @jhowardmsft - For RS3, we can remove the retries. Also consider
+		// TODO: For RS3, we can remove the retries. Also consider
 		// using platform APIs (if available) to get this more succinctly. Also
 		// consider enhancing the Remove() interface to have context of why
 		// the remove is being called - that could improve efficiency by not
@@ -294,8 +293,10 @@ func (d *Driver) Remove(id string) error {
 		// not required.
 		computeSystems, err = hcsshim.GetContainers(hcsshim.ComputeSystemQuery{})
 		if err != nil {
-			if (osv.Build < 15139) &&
-				((err == hcsshim.ErrVmcomputeOperationInvalidState) || (err == hcsshim.ErrVmcomputeOperationAccessIsDenied)) {
+			if osversion.Build() >= osversion.RS3 {
+				return err
+			}
+			if (err == hcsshim.ErrVmcomputeOperationInvalidState) || (err == hcsshim.ErrVmcomputeOperationAccessIsDenied) {
 				if retryCount >= 500 {
 					break
 				}
@@ -338,11 +339,14 @@ func (d *Driver) Remove(id string) error {
 		// If permission denied, it's possible that the scratch is still mounted, an
 		// artifact after a hard daemon crash for example. Worth a shot to try detaching it
 		// before retrying the rename.
-		if detachErr := vhd.DetachVhd(filepath.Join(layerPath, "sandbox.vhdx")); detachErr != nil {
-			return errors.Wrapf(err, "failed to detach VHD: %s", detachErr)
-		}
-		if renameErr := os.Rename(layerPath, tmpLayerPath); renameErr != nil && !os.IsNotExist(renameErr) {
-			return errors.Wrapf(err, "second rename attempt following detach failed: %s", renameErr)
+		sandbox := filepath.Join(layerPath, "sandbox.vhdx")
+		if _, statErr := os.Stat(sandbox); statErr == nil {
+			if detachErr := vhd.DetachVhd(sandbox); detachErr != nil {
+				return errors.Wrapf(err, "failed to detach VHD: %s", detachErr)
+			}
+			if renameErr := os.Rename(layerPath, tmpLayerPath); renameErr != nil && !os.IsNotExist(renameErr) {
+				return errors.Wrapf(err, "second rename attempt following detach failed: %s", renameErr)
+			}
 		}
 	}
 	if err := hcsshim.DestroyLayer(d.info, tmpID); err != nil {

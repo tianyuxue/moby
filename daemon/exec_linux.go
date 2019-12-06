@@ -1,11 +1,13 @@
 package daemon // import "github.com/docker/docker/daemon"
 
 import (
+	"context"
+
 	"github.com/docker/docker/container"
-	"github.com/docker/docker/daemon/caps"
 	"github.com/docker/docker/daemon/exec"
+	"github.com/docker/docker/oci/caps"
 	"github.com/opencontainers/runc/libcontainer/apparmor"
-	"github.com/opencontainers/runtime-spec/specs-go"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 func (daemon *Daemon) execSetPlatformOpt(c *container.Container, ec *exec.Config, p *specs.Process) error {
@@ -36,12 +38,12 @@ func (daemon *Daemon) execSetPlatformOpt(c *container.Container, ec *exec.Config
 		} else if c.HostConfig.Privileged {
 			// `docker exec --privileged` does not currently disable AppArmor
 			// profiles. Privileged configuration of the container is inherited
-			appArmorProfile = "unconfined"
+			appArmorProfile = unconfinedAppArmorProfile
 		} else {
-			appArmorProfile = "docker-default"
+			appArmorProfile = defaultApparmorProfile
 		}
 
-		if appArmorProfile == "docker-default" {
+		if appArmorProfile == defaultApparmorProfile {
 			// Unattended upgrades and other fun services can unload AppArmor
 			// profiles inadvertently. Since we cannot store our profile in
 			// /etc/apparmor.d, nor can we practically add other ways of
@@ -54,6 +56,6 @@ func (daemon *Daemon) execSetPlatformOpt(c *container.Container, ec *exec.Config
 		}
 		p.ApparmorProfile = appArmorProfile
 	}
-	daemon.setRlimits(&specs.Spec{Process: p}, c)
-	return nil
+	s := &specs.Spec{Process: p}
+	return WithRlimits(daemon, c)(context.Background(), nil, nil, s)
 }

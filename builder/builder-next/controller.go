@@ -1,13 +1,19 @@
 package buildkit
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"path/filepath"
 
 	"github.com/containerd/containerd/content/local"
+	ctdmetadata "github.com/containerd/containerd/metadata"
+	"github.com/containerd/containerd/platforms"
+	"github.com/containerd/containerd/snapshots"
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/builder/builder-next/adapters/containerimage"
+	"github.com/docker/docker/builder/builder-next/adapters/localinlinecache"
 	"github.com/docker/docker/builder/builder-next/adapters/snapshot"
 	containerimageexp "github.com/docker/docker/builder/builder-next/exporter"
 	"github.com/docker/docker/builder/builder-next/imagerefchecker"
@@ -17,22 +23,28 @@ import (
 	units "github.com/docker/go-units"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/metadata"
-	registryremotecache "github.com/moby/buildkit/cache/remotecache/registry"
+	"github.com/moby/buildkit/cache/remotecache"
+	inlineremotecache "github.com/moby/buildkit/cache/remotecache/inline"
+	localremotecache "github.com/moby/buildkit/cache/remotecache/local"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/control"
-	"github.com/moby/buildkit/exporter"
 	"github.com/moby/buildkit/frontend"
 	dockerfile "github.com/moby/buildkit/frontend/dockerfile/builder"
 	"github.com/moby/buildkit/frontend/gateway"
 	"github.com/moby/buildkit/frontend/gateway/forwarder"
-	"github.com/moby/buildkit/snapshot/blobmapping"
+	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/solver/bboltcachestorage"
+	"github.com/moby/buildkit/util/binfmt_misc"
+	"github.com/moby/buildkit/util/entitlements"
+	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/worker"
+	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	bolt "go.etcd.io/bbolt"
 )
 
 func newController(rt http.RoundTripper, opt Opt) (*control.Controller, error) {
-	if err := os.MkdirAll(opt.Root, 0700); err != nil {
+	if err := os.MkdirAll(opt.Root, 0711); err != nil {
 		return nil, err
 	}
 
@@ -48,33 +60,38 @@ func newController(rt http.RoundTripper, opt Opt) (*control.Controller, error) {
 		return nil, errors.Errorf("could not access graphdriver")
 	}
 
-	sbase, err := snapshot.NewSnapshotter(snapshot.Opt{
-		GraphDriver: driver,
-		LayerStore:  dist.LayerStore,
-		Root:        root,
-	})
-	if err != nil {
-		return nil, err
-	}
-
 	store, err := local.NewStore(filepath.Join(root, "content"))
 	if err != nil {
 		return nil, err
 	}
-	store = &contentStoreNoLabels{store}
+
+	db, err := bolt.Open(filepath.Join(root, "containerdmeta.db"), 0644, nil)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	mdb := ctdmetadata.NewDB(db, store, map[string]snapshots.Snapshotter{})
+
+	store = containerdsnapshot.NewContentStore(mdb.ContentStore(), "buildkit")
+
+	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit")
+
+	snapshotter, lm, err := snapshot.NewSnapshotter(snapshot.Opt{
+		GraphDriver:     driver,
+		LayerStore:      dist.LayerStore,
+		Root:            root,
+		IdentityMapping: opt.IdentityMapping,
+	}, lm)
+	if err != nil {
+		return nil, err
+	}
 
 	md, err := metadata.NewStore(filepath.Join(root, "metadata.db"))
 	if err != nil {
 		return nil, err
 	}
 
-	snapshotter := blobmapping.NewSnapshotter(blobmapping.Opt{
-		Content:       store,
-		Snapshotter:   sbase,
-		MetadataStore: md,
-	})
-
-	layerGetter, ok := sbase.(imagerefchecker.LayerGetter)
+	layerGetter, ok := snapshotter.(imagerefchecker.LayerGetter)
 	if !ok {
 		return nil, errors.Errorf("snapshotter does not implement layergetter")
 	}
@@ -88,13 +105,14 @@ func newController(rt http.RoundTripper, opt Opt) (*control.Controller, error) {
 		Snapshotter:     snapshotter,
 		MetadataStore:   md,
 		PruneRefChecker: refChecker,
+		LeaseManager:    lm,
+		ContentStore:    store,
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	src, err := containerimage.NewSource(containerimage.SourceOpt{
-		SessionManager:  opt.SessionManager,
 		CacheAccessor:   cm,
 		ContentStore:    store,
 		DownloadManager: dist.DownloadManager,
@@ -102,17 +120,20 @@ func newController(rt http.RoundTripper, opt Opt) (*control.Controller, error) {
 		ImageStore:      dist.ImageStore,
 		ReferenceStore:  dist.ReferenceStore,
 		ResolverOpt:     opt.ResolverOpt,
+		LayerStore:      dist.LayerStore,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	exec, err := newExecutor(root, opt.DefaultCgroupParent, opt.NetworkController)
+	dns := getDNSConfig(opt.DNSConfig)
+
+	exec, err := newExecutor(root, opt.DefaultCgroupParent, opt.NetworkController, dns, opt.Rootless, opt.IdentityMapping)
 	if err != nil {
 		return nil, err
 	}
 
-	differ, ok := sbase.(containerimageexp.Differ)
+	differ, ok := snapshotter.(containerimageexp.Differ)
 	if !ok {
 		return nil, errors.Errorf("snapshotter doesn't support differ")
 	}
@@ -136,9 +157,26 @@ func newController(rt http.RoundTripper, opt Opt) (*control.Controller, error) {
 		return nil, errors.Wrap(err, "could not get builder GC policy")
 	}
 
+	layers, ok := snapshotter.(mobyworker.LayerAccess)
+	if !ok {
+		return nil, errors.Errorf("snapshotter doesn't support differ")
+	}
+
+	p, err := parsePlatforms(binfmt_misc.SupportedPlatforms())
+	if err != nil {
+		return nil, err
+	}
+
+	leases, err := lm.List(context.TODO(), "labels.\"buildkit/lease.temporary\"")
+	if err != nil {
+		return nil, err
+	}
+	for _, l := range leases {
+		lm.Delete(context.TODO(), l)
+	}
+
 	wopt := mobyworker.Opt{
 		ID:                "moby",
-		SessionManager:    opt.SessionManager,
 		MetadataStore:     md,
 		ContentStore:      store,
 		CacheManager:      cm,
@@ -148,10 +186,10 @@ func newController(rt http.RoundTripper, opt Opt) (*control.Controller, error) {
 		ImageSource:       src,
 		DownloadManager:   dist.DownloadManager,
 		V2MetadataService: dist.V2MetadataService,
-		Exporters: map[string]exporter.Exporter{
-			"moby": exp,
-		},
-		Transport: rt,
+		Exporter:          exp,
+		Transport:         rt,
+		Layers:            layers,
+		Platforms:         p,
 	}
 
 	wc := &worker.Controller{}
@@ -167,12 +205,18 @@ func newController(rt http.RoundTripper, opt Opt) (*control.Controller, error) {
 	}
 
 	return control.NewController(control.Opt{
-		SessionManager:           opt.SessionManager,
-		WorkerController:         wc,
-		Frontends:                frontends,
-		CacheKeyStorage:          cacheStorage,
-		ResolveCacheImporterFunc: registryremotecache.ResolveCacheImporterFunc(opt.SessionManager, opt.ResolverOpt),
-		// TODO: set ResolveCacheExporterFunc for exporting cache
+		SessionManager:   opt.SessionManager,
+		WorkerController: wc,
+		Frontends:        frontends,
+		CacheKeyStorage:  cacheStorage,
+		ResolveCacheImporterFuncs: map[string]remotecache.ResolveCacheImporterFunc{
+			"registry": localinlinecache.ResolveCacheImporterFunc(opt.SessionManager, opt.ResolverOpt, store, dist.ReferenceStore, dist.ImageStore),
+			"local":    localremotecache.ResolveCacheImporterFunc(opt.SessionManager),
+		},
+		ResolveCacheExporterFuncs: map[string]remotecache.ResolveCacheExporterFunc{
+			"inline": inlineremotecache.ResolveCacheExporterFunc(),
+		},
+		Entitlements: getEntitlements(opt.BuilderConfig),
 	})
 }
 
@@ -206,7 +250,7 @@ func getGCPolicy(conf config.BuilderConfig, root string) ([]client.PruneInfo, er
 				gcPolicy[i], err = toBuildkitPruneInfo(types.BuildCachePruneOptions{
 					All:         p.All,
 					KeepStorage: b,
-					Filters:     p.Filter,
+					Filters:     filters.Args(p.Filter),
 				})
 				if err != nil {
 					return nil, err
@@ -215,4 +259,28 @@ func getGCPolicy(conf config.BuilderConfig, root string) ([]client.PruneInfo, er
 		}
 	}
 	return gcPolicy, nil
+}
+
+func parsePlatforms(platformsStr []string) ([]specs.Platform, error) {
+	out := make([]specs.Platform, 0, len(platformsStr))
+	for _, s := range platformsStr {
+		p, err := platforms.Parse(s)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, platforms.Normalize(p))
+	}
+	return out, nil
+}
+
+func getEntitlements(conf config.BuilderConfig) []string {
+	var ents []string
+	// Incase of no config settings, NetworkHost should be enabled & SecurityInsecure must be disabled.
+	if conf.Entitlements.NetworkHost == nil || *conf.Entitlements.NetworkHost {
+		ents = append(ents, string(entitlements.EntitlementNetworkHost))
+	}
+	if conf.Entitlements.SecurityInsecure != nil && *conf.Entitlements.SecurityInsecure {
+		ents = append(ents, string(entitlements.EntitlementSecurityInsecure))
+	}
+	return ents
 }

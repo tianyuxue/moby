@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -57,6 +56,8 @@ type nodeStartConfig struct {
 	DefaultAddressPool []string
 	// SubnetSize contains subnet size of DefaultAddressPool
 	SubnetSize uint32
+	// DataPathPort contains Data path port (VXLAN UDP port) number that is used for data traffic.
+	DataPathPort uint32
 	// JoinInProgress is set to true if a join operation has started, but
 	// not completed yet.
 	JoinInProgress bool
@@ -102,7 +103,7 @@ func (n *nodeRunner) Start(conf nodeStartConfig) error {
 
 func (n *nodeRunner) start(conf nodeStartConfig) error {
 	var control string
-	if runtime.GOOS == "windows" {
+	if isWindows {
 		control = `\\.\pipe\` + controlSocket
 	} else {
 		control = filepath.Join(n.cluster.runtimeRoot, controlSocket)
@@ -125,6 +126,7 @@ func (n *nodeRunner) start(conf nodeStartConfig) error {
 		NetworkConfig: &swarmallocator.NetworkConfig{
 			DefaultAddrPool: conf.DefaultAddressPool,
 			SubnetSize:      conf.SubnetSize,
+			VXLANUDPPort:    conf.DataPathPort,
 		},
 		JoinAddr:  joinAddr,
 		StateDir:  n.cluster.root,
@@ -295,6 +297,11 @@ func (n *nodeRunner) Stop() error {
 		n.cancelReconnect = nil
 	}
 	if n.swarmNode == nil {
+		// even though the swarm node is nil we still may need
+		// to send a node leave event to perform any cleanup required.
+		if n.cluster != nil {
+			n.cluster.SendClusterEvent(lncluster.EventNodeLeave)
+		}
 		n.mu.Unlock()
 		return nil
 	}

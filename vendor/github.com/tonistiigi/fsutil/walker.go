@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/docker/docker/pkg/fileutils"
@@ -18,7 +19,7 @@ type WalkOpt struct {
 	// FollowPaths contains symlinks that are resolved into include patterns
 	// before performing the fs walk
 	FollowPaths []string
-	Map         func(*types.Stat) bool
+	Map         FilterFunc
 }
 
 func Walk(ctx context.Context, p string, opt *WalkOpt, fn filepath.WalkFunc) error {
@@ -71,7 +72,7 @@ func Walk(ctx context.Context, p string, opt *WalkOpt, fn filepath.WalkFunc) err
 			return err
 		}
 		defer func() {
-			if retErr != nil && os.IsNotExist(errors.Cause(retErr)) {
+			if retErr != nil && isNotExist(retErr) {
 				retErr = filepath.SkipDir
 			}
 		}()
@@ -156,7 +157,7 @@ func Walk(ctx context.Context, p string, opt *WalkOpt, fn filepath.WalkFunc) err
 			return ctx.Err()
 		default:
 			if opt != nil && opt.Map != nil {
-				if allowed := opt.Map(stat); !allowed {
+				if allowed := opt.Map(stat.Path, stat); !allowed {
 					return nil
 				}
 			}
@@ -215,4 +216,15 @@ func trimUntilIndex(str, sep string, count int) string {
 			return str[:i-len(sep)]
 		}
 	}
+}
+
+func isNotExist(err error) bool {
+	err = errors.Cause(err)
+	if os.IsNotExist(err) {
+		return true
+	}
+	if pe, ok := err.(*os.PathError); ok {
+		err = pe.Err
+	}
+	return err == syscall.ENOTDIR
 }

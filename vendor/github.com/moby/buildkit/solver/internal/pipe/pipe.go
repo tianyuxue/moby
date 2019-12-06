@@ -11,11 +11,15 @@ import (
 type channel struct {
 	OnSendCompletion func()
 	value            atomic.Value
-	lastValue        interface{}
+	lastValue        *wrappedValue
+}
+
+type wrappedValue struct {
+	value interface{}
 }
 
 func (c *channel) Send(v interface{}) {
-	c.value.Store(v)
+	c.value.Store(&wrappedValue{value: v})
 	if c.OnSendCompletion != nil {
 		c.OnSendCompletion()
 	}
@@ -23,11 +27,11 @@ func (c *channel) Send(v interface{}) {
 
 func (c *channel) Receive() (interface{}, bool) {
 	v := c.value.Load()
-	if c.lastValue == v {
+	if v == nil || v.(*wrappedValue) == c.lastValue {
 		return nil, false
 	}
-	c.lastValue = v
-	return v, true
+	c.lastValue = v.(*wrappedValue)
+	return v.(*wrappedValue).value, true
 }
 
 type Pipe struct {
@@ -89,7 +93,6 @@ func New(req Request) *Pipe {
 	roundTripCh := &channel{}
 	pw := &sender{
 		req:         req,
-		recvChannel: cancelCh,
 		sendChannel: roundTripCh,
 	}
 	pr := &receiver{
@@ -125,7 +128,6 @@ func New(req Request) *Pipe {
 type sender struct {
 	status      Status
 	req         Request
-	recvChannel *channel
 	sendChannel *channel
 	mu          sync.Mutex
 }

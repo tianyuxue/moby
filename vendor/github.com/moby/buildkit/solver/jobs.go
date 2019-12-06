@@ -141,7 +141,7 @@ func (s *state) combinedCacheManager() CacheManager {
 		return s.mainCache
 	}
 
-	return newCombinedCacheManager(cms, s.mainCache)
+	return NewCombinedCacheManager(cms, s.mainCache)
 }
 
 func (s *state) Release() {
@@ -171,12 +171,13 @@ func (sb *subBuilder) Build(ctx context.Context, e Edge) (CachedResult, error) {
 }
 
 func (sb *subBuilder) Context(ctx context.Context) context.Context {
+	ctx = session.NewContext(ctx, sb.state.getSessionID())
 	return opentracing.ContextWithSpan(progress.WithProgress(ctx, sb.mpw), sb.mspan)
 }
 
 func (sb *subBuilder) EachValue(ctx context.Context, key string, fn func(interface{}) error) error {
 	sb.mu.Lock()
-	defer sb.mu.Lock()
+	defer sb.mu.Unlock()
 	for j := range sb.jobs {
 		if err := j.EachValue(ctx, key, fn); err != nil {
 			return err
@@ -403,7 +404,9 @@ func (jl *Solver) Get(id string) (*Job, error) {
 
 	go func() {
 		<-ctx.Done()
+		jl.mu.Lock()
 		jl.updateCond.Broadcast()
+		jl.mu.Unlock()
 	}()
 
 	jl.mu.RLock()
@@ -475,6 +478,7 @@ func (j *Job) Discard() error {
 }
 
 func (j *Job) Context(ctx context.Context) context.Context {
+	ctx = session.NewContext(ctx, j.SessionID)
 	return progress.WithProgress(ctx, j.pw)
 }
 

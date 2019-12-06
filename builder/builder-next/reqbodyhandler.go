@@ -35,13 +35,14 @@ func (h *reqBodyHandler) newRequest(rc io.ReadCloser) (string, func()) {
 		h.mu.Lock()
 		delete(h.requests, id)
 		h.mu.Unlock()
+		rc.Close()
 	}
 }
 
 func (h *reqBodyHandler) RoundTrip(req *http.Request) (*http.Response, error) {
 	host := req.URL.Host
 	if strings.HasPrefix(host, urlPrefix) {
-		if req.Method != "GET" {
+		if req.Method != http.MethodGet {
 			return nil, errors.Errorf("invalid request")
 		}
 		id := strings.TrimPrefix(host, urlPrefix)
@@ -56,7 +57,7 @@ func (h *reqBodyHandler) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		resp := &http.Response{
 			Status:        "200 OK",
-			StatusCode:    200,
+			StatusCode:    http.StatusOK,
 			Body:          rc,
 			ContentLength: -1,
 		}

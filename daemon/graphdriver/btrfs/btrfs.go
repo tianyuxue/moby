@@ -32,7 +32,7 @@ import (
 	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/pkg/parsers"
 	"github.com/docker/docker/pkg/system"
-	"github.com/docker/go-units"
+	units "github.com/docker/go-units"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -178,7 +178,7 @@ func (d *Driver) Cleanup() error {
 	}
 
 	if umountErr != nil {
-		return errors.Wrapf(umountErr, "error unmounting %s", d.home)
+		return umountErr
 	}
 
 	return nil
@@ -606,7 +606,7 @@ func (d *Driver) parseStorageOpt(storageOpt map[string]string, driver *Driver) e
 
 // Set btrfs storage size
 func (d *Driver) setStorageSize(dir string, driver *Driver) error {
-	if driver.options.size <= 0 {
+	if driver.options.size == 0 {
 		return fmt.Errorf("btrfs: invalid storage size: %s", units.HumanSize(float64(driver.options.size)))
 	}
 	if d.options.minSpace > 0 && driver.options.size < d.options.minSpace {

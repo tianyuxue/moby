@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -57,6 +58,63 @@ func testEventBatch(events []wrappedEvent) *eventBatch {
 		batch.add(event, eventlen)
 	}
 	return batch
+}
+
+func TestNewStreamConfig(t *testing.T) {
+	tests := []struct {
+		logStreamName      string
+		logGroupName       string
+		logCreateGroup     string
+		logNonBlocking     string
+		forceFlushInterval string
+		maxBufferedEvents  string
+		datetimeFormat     string
+		multilinePattern   string
+		shouldErr          bool
+		testName           string
+	}{
+		{"", groupName, "", "", "", "", "", "", false, "defaults"},
+		{"", groupName, "invalid create group", "", "", "", "", "", true, "invalid create group"},
+		{"", groupName, "", "", "invalid flush interval", "", "", "", true, "invalid flush interval"},
+		{"", groupName, "", "", "", "invalid max buffered events", "", "", true, "invalid max buffered events"},
+		{"", groupName, "", "", "", "", "", "n{1001}", true, "invalid multiline pattern"},
+		{"", groupName, "", "", "15", "", "", "", false, "flush interval at 15"},
+		{"", groupName, "", "", "", "1024", "", "", false, "max buffered events at 1024"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.testName, func(t *testing.T) {
+			cfg := map[string]string{
+				logGroupKey:           tc.logGroupName,
+				logCreateGroupKey:     tc.logCreateGroup,
+				"mode":                tc.logNonBlocking,
+				forceFlushIntervalKey: tc.forceFlushInterval,
+				maxBufferedEventsKey:  tc.maxBufferedEvents,
+				logStreamKey:          tc.logStreamName,
+				datetimeFormatKey:     tc.datetimeFormat,
+				multilinePatternKey:   tc.multilinePattern,
+			}
+
+			info := logger.Info{
+				Config: cfg,
+			}
+			logStreamConfig, err := newStreamConfig(info)
+			if tc.shouldErr {
+				assert.Check(t, err != nil, "Expected an error")
+			} else {
+				assert.Check(t, err == nil, "Unexpected error")
+				assert.Check(t, logStreamConfig.logGroupName == tc.logGroupName, "Unexpected logGroupName")
+				if tc.forceFlushInterval != "" {
+					forceFlushIntervalAsInt, _ := strconv.Atoi(info.Config[forceFlushIntervalKey])
+					assert.Check(t, logStreamConfig.forceFlushInterval == time.Duration(forceFlushIntervalAsInt)*time.Second, "Unexpected forceFlushInterval")
+				}
+				if tc.maxBufferedEvents != "" {
+					maxBufferedEvents, _ := strconv.Atoi(info.Config[maxBufferedEventsKey])
+					assert.Check(t, logStreamConfig.maxBufferedEvents == maxBufferedEvents, "Unexpected maxBufferedEvents")
+				}
+			}
+		})
+	}
 }
 
 func TestNewAWSLogsClientUserAgentHandler(t *testing.T) {
@@ -114,8 +172,8 @@ func TestNewAWSLogsClientRegionDetect(t *testing.T) {
 	}
 
 	mockMetadata := newMockMetadataClient()
-	newRegionFinder = func() regionFinder {
-		return mockMetadata
+	newRegionFinder = func() (regionFinder, error) {
+		return mockMetadata, nil
 	}
 	mockMetadata.regionResult <- &regionResult{
 		successResult: "us-east-1",
@@ -227,6 +285,9 @@ func TestLogClosed(t *testing.T) {
 	}
 }
 
+// TestLogBlocking tests that the Log method blocks appropriately when
+// non-blocking behavior is not enabled.  Blocking is achieved through an
+// internal channel that must be drained for Log to return.
 func TestLogBlocking(t *testing.T) {
 	mockClient := newMockClient()
 	stream := &logStream{
@@ -241,18 +302,20 @@ func TestLogBlocking(t *testing.T) {
 		err := stream.Log(&logger.Message{})
 		errorCh <- err
 	}()
+	// block until the goroutine above has started
 	<-started
 	select {
 	case err := <-errorCh:
 		t.Fatal("Expected stream.Log to block: ", err)
 	default:
-		break
 	}
+	// assuming it is blocked, we can now try to drain the internal channel and
+	// unblock it
 	select {
-	case <-stream.messages:
-		break
-	default:
+	case <-time.After(10 * time.Millisecond):
+		// if we're unable to drain the channel within 10ms, something seems broken
 		t.Fatal("Expected to be able to read from stream.messages but was unable to")
+	case <-stream.messages:
 	}
 	select {
 	case err := <-errorCh:
@@ -282,7 +345,7 @@ func TestLogNonBlockingBufferFull(t *testing.T) {
 		logNonBlocking: true,
 	}
 	stream.messages <- &logger.Message{}
-	errorCh := make(chan error)
+	errorCh := make(chan error, 1)
 	started := make(chan bool)
 	go func() {
 		started <- true
@@ -762,10 +825,10 @@ func TestCollectBatchMultilinePatternMaxEventAge(t *testing.T) {
 		Timestamp: time.Now().Add(time.Second),
 	})
 
-	// Fire ticker batchPublishFrequency seconds later
-	ticks <- time.Now().Add(batchPublishFrequency + time.Second)
+	// Fire ticker defaultForceFlushInterval seconds later
+	ticks <- time.Now().Add(defaultForceFlushInterval + time.Second)
 
-	// Verify single multiline event is flushed after maximum event buffer age (batchPublishFrequency)
+	// Verify single multiline event is flushed after maximum event buffer age (defaultForceFlushInterval)
 	argument := <-mockClient.putLogEventsArgument
 	assert.Check(t, argument != nil, "Expected non-nil PutLogEventsInput")
 	assert.Check(t, is.Equal(1, len(argument.LogEvents)), "Expected single multiline event")
@@ -777,8 +840,8 @@ func TestCollectBatchMultilinePatternMaxEventAge(t *testing.T) {
 		Timestamp: time.Now().Add(time.Second),
 	})
 
-	// Fire ticker another batchPublishFrequency seconds later
-	ticks <- time.Now().Add(2*batchPublishFrequency + time.Second)
+	// Fire ticker another defaultForceFlushInterval seconds later
+	ticks <- time.Now().Add(2*defaultForceFlushInterval + time.Second)
 
 	// Verify the event buffer is truly flushed - we should only receive a single event
 	argument = <-mockClient.putLogEventsArgument
@@ -880,7 +943,7 @@ func TestCollectBatchMultilinePatternMaxEventSize(t *testing.T) {
 	})
 
 	// Fire ticker
-	ticks <- time.Now().Add(batchPublishFrequency)
+	ticks <- time.Now().Add(defaultForceFlushInterval)
 
 	// Verify multiline events
 	// We expect a maximum sized event with no new line characters and a
@@ -1417,6 +1480,64 @@ func TestValidateLogOptionsDatetimeFormatAndMultilinePattern(t *testing.T) {
 	err := ValidateLogOpt(cfg)
 	assert.Check(t, err != nil, "Expected an error")
 	assert.Check(t, is.Equal(err.Error(), conflictingLogOptionsError), "Received invalid error")
+}
+
+func TestValidateLogOptionsForceFlushIntervalSeconds(t *testing.T) {
+	tests := []struct {
+		input     string
+		shouldErr bool
+	}{
+		{"0", true},
+		{"-1", true},
+		{"a", true},
+		{"10", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			cfg := map[string]string{
+				forceFlushIntervalKey: tc.input,
+				logGroupKey:           groupName,
+			}
+
+			err := ValidateLogOpt(cfg)
+			if tc.shouldErr {
+				expectedErr := "must specify a positive integer for log opt 'awslogs-force-flush-interval-seconds': " + tc.input
+				assert.Error(t, err, expectedErr)
+			} else {
+				assert.NilError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateLogOptionsMaxBufferedEvents(t *testing.T) {
+	tests := []struct {
+		input     string
+		shouldErr bool
+	}{
+		{"0", true},
+		{"-1", true},
+		{"a", true},
+		{"10", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			cfg := map[string]string{
+				maxBufferedEventsKey: tc.input,
+				logGroupKey:          groupName,
+			}
+
+			err := ValidateLogOpt(cfg)
+			if tc.shouldErr {
+				expectedErr := "must specify a positive integer for log opt 'awslogs-max-buffered-events': " + tc.input
+				assert.Error(t, err, expectedErr)
+			} else {
+				assert.NilError(t, err)
+			}
+		})
+	}
 }
 
 func TestCreateTagSuccess(t *testing.T) {

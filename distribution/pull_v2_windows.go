@@ -4,13 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
-	"os"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/Microsoft/hcsshim/osversion"
+	"github.com/containerd/containerd/platforms"
 	"github.com/docker/distribution"
 	"github.com/docker/distribution/manifest/manifestlist"
 	"github.com/docker/distribution/manifest/schema2"
@@ -40,7 +42,7 @@ func (ld *v2LayerDescriptor) open(ctx context.Context) (distribution.ReadSeekClo
 	// We're done if the registry has this blob.
 	if err == nil {
 		// Seek does an HTTP GET.  If it succeeds, the blob really is accessible.
-		if _, err = rsc.Seek(0, os.SEEK_SET); err == nil {
+		if _, err = rsc.Seek(0, io.SeekStart); err == nil {
 			return rsc, nil
 		}
 		rsc.Close()
@@ -52,7 +54,7 @@ func (ld *v2LayerDescriptor) open(ctx context.Context) (distribution.ReadSeekClo
 		rsc = transport.NewHTTPReadSeeker(http.DefaultClient, url, nil)
 
 		// Seek does an HTTP GET.  If it succeeds, the blob really is accessible.
-		_, err = rsc.Seek(0, os.SEEK_SET)
+		_, err = rsc.Seek(0, io.SeekStart)
 		if err == nil {
 			break
 		}
@@ -64,7 +66,7 @@ func (ld *v2LayerDescriptor) open(ctx context.Context) (distribution.ReadSeekClo
 }
 
 func filterManifests(manifests []manifestlist.ManifestDescriptor, p specs.Platform) []manifestlist.ManifestDescriptor {
-	version := system.GetOSVersion()
+	version := osversion.Get()
 	osVersion := fmt.Sprintf("%d.%d.%d", version.MajorVersion, version.MinorVersion, version.Build)
 	logrus.Debugf("will prefer Windows entries with version %s", osVersion)
 
@@ -122,7 +124,7 @@ func (mbv manifestsByVersion) Swap(i, j int) {
 // Fixes https://github.com/moby/moby/issues/36184.
 func checkImageCompatibility(imageOS, imageOSVersion string) error {
 	if imageOS == "windows" {
-		hostOSV := system.GetOSVersion()
+		hostOSV := osversion.Get()
 		splitImageOSVersion := strings.Split(imageOSVersion, ".") // eg 10.0.16299.nnnn
 		if len(splitImageOSVersion) >= 3 {
 			if imageOSBuild, err := strconv.Atoi(splitImageOSVersion[2]); err == nil {
@@ -135,4 +137,11 @@ func checkImageCompatibility(imageOS, imageOSVersion string) error {
 		}
 	}
 	return nil
+}
+
+func formatPlatform(platform specs.Platform) string {
+	if platform.OS == "" {
+		platform = platforms.DefaultSpec()
+	}
+	return fmt.Sprintf("%s %s", platforms.Format(platform), osversion.Get().ToString())
 }
